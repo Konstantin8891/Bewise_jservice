@@ -1,17 +1,15 @@
-import requests
-
 from datetime import date
+from typing import Optional
+
+import aiohttp
 
 # Встречается текст загрязнённый html тегами, поэтому решил очистить
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import Optional
+from sqlalchemy import select
+from sqlalchemy.ext import asyncio as sea
 
-import sys
-sys.path.append('..')
-
-from database import SessionLocal
+from database import get_async_session
 from schemas import QuestionSchema
 from models import Question
 
@@ -19,30 +17,27 @@ from models import Question
 router = APIRouter(prefix='', tags=['main_router'])
 
 
-def get_db() -> None:
-    try:
-        db = SessionLocal()
-        yield db
-    finally:
-        db.close()
-
-
 @router.post('/')
 async def questions(
-    question_number: QuestionSchema, db: Session = Depends(get_db)
+    question_number: QuestionSchema,
+    db: sea.AsyncSession = Depends(get_async_session)
 ) -> Optional[str]:
     try:
-        quiz = requests.get(
+        url = (
             'https://jservice.io/api/random?count='
             f'{question_number.questions_num}'
-        ).json()
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                quiz = await response.json()
     except Exception:
         raise HTTPException(status_code=503, detail='Service is unavailable')
     while_loop_counter = 0
     for i in range(len(quiz)):
-        question_instance = db.query(Question).filter(
+        question_instance = await db.execute(select(Question).where(
             Question.question == quiz[i]['question']
-        ).first()
+        ))
+        question_instance = question_instance.scalar_one_or_none()
         # встречаются записи у которых вместо ответа и вопроса "="
         # не уверен что такие записи нужны в бд
         if question_instance or quiz[i]['question'] == '=':
@@ -53,16 +48,20 @@ async def questions(
                         status_code=508, detail='Exceed max cycles of loop'
                     )
                 try:
-                    quiz[i] = requests.get(
-                        'https://jservice.io/api/random?count=1'
-                    ).json()[0]
+                    url = 'https://jservice.io/api/random?count=1'
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as response:
+                            quiz_resp = await response.json()[0]
+                            quiz[i] = quiz_resp
                 except Exception:
                     raise HTTPException(
                         status_code=503, detail='Service is unavailable'
                     )
-                question_instance = db.query(Question).filter(
+                question_instance = await db.execute(select(Question).where(
                     Question.question == quiz[i]['question']
-                ).first()
+                ))
+                question_instance = question_instance.scalar_one_or_none()
+
                 if question_instance:
                     continue
                 else:
@@ -74,7 +73,7 @@ async def questions(
             date_created=date_cr
         )
         db.add(question_instance)
-        db.commit()
+        await db.commit()
     if question_number.questions_num == 1:
         return
     return quiz[len(quiz) - 2]['question']
